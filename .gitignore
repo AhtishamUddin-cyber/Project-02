@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.coverage
+
+# Secrets / local config -- never commit these
+.env
+.streamlit/secrets.toml
+
+# OS junk
+.DS_Store
+Thumbs.db

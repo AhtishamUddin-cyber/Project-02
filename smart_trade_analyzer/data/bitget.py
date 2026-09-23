@@ -53,7 +53,7 @@ from .exceptions import (
     DataSourceUnavailableError,
     InvalidSymbolOrTimeframeError,
 )
-from .models import NormalizationResult, TickerPrice, utc_now
+from .models import Instrument, NormalizationResult, TickerPrice, utc_now
 from .normalizer import normalize_candles, normalize_ticker_price
 
 BASE_URL = "https://api.bitget.com"
@@ -61,11 +61,29 @@ SPOT_CANDLES_URL = f"{BASE_URL}/api/v2/spot/market/candles"
 MIX_CANDLES_URL = f"{BASE_URL}/api/v2/mix/market/candles"
 SPOT_TICKER_URL = f"{BASE_URL}/api/v2/spot/market/tickers"
 MIX_TICKER_URL = f"{BASE_URL}/api/v2/mix/market/ticker"
+# NEW in this phase -- instrument discovery. Verified directly against
+# Bitget's own current API documentation (not invented): spot's endpoint
+# returns {"data": [{"symbol", "baseCoin", "quoteCoin", "status": "online"|...}]},
+# futures' contracts endpoint returns {"data": [{"symbol", "baseCoin",
+# "quoteCoin", "symbolStatus": "normal"|...}]} -- same {"data": [...]}
+# envelope as every endpoint above, so _extract_data_list already handles
+# both unchanged.
+SPOT_SYMBOLS_URL = f"{BASE_URL}/api/v2/spot/public/symbols"
+MIX_CONTRACTS_URL = f"{BASE_URL}/api/v2/mix/market/contracts"
 
 # Verified exact order from the existing project (FUTURES_PRODUCT_TYPES,
 # analyzer.py line 43) -- usdt-futures first because it is the standard,
 # most liquid contract type and should win ties.
 FUTURES_PRODUCT_TYPES = ["usdt-futures", "susdt-futures", "usdc-futures", "coin-futures"]
+
+# NEW in this phase. Instrument discovery is deliberately scoped to
+# USDT-margined futures only (the task's own stated minimum: "Support at
+# minimum: Spot, USDT Futures") -- the same PRIMARY product type
+# _fetch_raw_candles already tries first, above. Listing across all four
+# FUTURES_PRODUCT_TYPES would mean deciding how to merge/dedupe contracts
+# that can appear under more than one product type with different specs,
+# which is out of scope for this phase and not requested.
+INSTRUMENT_DISCOVERY_FUTURES_PRODUCT_TYPE = "usdt-futures"
 
 # Verified exact casing from the existing project's get_realtime_indicators /
 # _fetch_candles_raw. Bitget's Spot candles endpoint and Futures/Mix candles
@@ -184,6 +202,42 @@ class BitgetMarketDataSource:
         except (DataSourceError, DataNormalizationError):
             return None
 
+    def list_instruments(self) -> List[Instrument]:
+        """Return every instrument Bitget currently lists for this
+        adapter's market, each flagged tradable/not per the exchange's
+        own status field -- never a hardcoded or fabricated list. Raises
+        a DataSourceError subclass (same taxonomy as get_candles) if the
+        instrument endpoint itself cannot be reached or parsed at all;
+        an individual malformed row within an otherwise-successful
+        response is skipped and logged (via the same `log` callback
+        already used for candle normalization issues), not raised.
+        """
+        if self.market_type == MarketType.FUTURES:
+            resp = self._get_with_retry(
+                MIX_CONTRACTS_URL, {"productType": INSTRUMENT_DISCOVERY_FUTURES_PRODUCT_TYPE},
+            )
+            raw_rows = _extract_data_list(resp, MIX_CONTRACTS_URL)
+            parse_row = _parse_futures_instrument
+        else:
+            resp = self._get_with_retry(SPOT_SYMBOLS_URL, {})
+            raw_rows = _extract_data_list(resp, SPOT_SYMBOLS_URL)
+            parse_row = _parse_spot_instrument
+
+        instruments: List[Instrument] = []
+        skipped = 0
+        for row in raw_rows:
+            instrument = parse_row(row)
+            if instrument is None:
+                skipped += 1
+                continue
+            instruments.append(instrument)
+        if skipped:
+            self._log(
+                f"{skipped} of {len(raw_rows)} instrument row(s) from Bitget "
+                f"({self.market_type.value}) could not be parsed and were skipped"
+            )
+        return instruments
+
     # -- internal: raw fetch (retry + product-type fallback live here) -
 
     def _fetch_raw_candles(self, symbol: str, granularity: str, limit: int) -> List[Any]:
@@ -298,3 +352,37 @@ def _extract_data_list(resp: requests.Response, url: str) -> List[Any]:
             f"response 'data' field from {url} is not a list (got {type(data).__name__})"
         )
     return data
+
+
+def _parse_spot_instrument(row: Any) -> Optional[Instrument]:
+    """One row of /api/v2/spot/public/symbols -> Instrument, or None if
+    the row is missing a field this project actually needs (malformed --
+    skipped by the caller, never raised for a single bad row). Verified
+    field names against Bitget's own documented response shape: symbol,
+    baseCoin, quoteCoin, status (tradable iff status == "online")."""
+    if not isinstance(row, dict):
+        return None
+    symbol, base, quote, status = row.get("symbol"), row.get("baseCoin"), row.get("quoteCoin"), row.get("status")
+    if not (isinstance(symbol, str) and symbol and isinstance(base, str) and base
+            and isinstance(quote, str) and quote and isinstance(status, str) and status):
+        return None
+    return Instrument(symbol=symbol, base_coin=base, quote_coin=quote, market_type=MarketType.SPOT,
+                       tradable=(status == "online"), status=status)
+
+
+def _parse_futures_instrument(row: Any) -> Optional[Instrument]:
+    """One row of /api/v2/mix/market/contracts -> Instrument, or None if
+    malformed. Verified field names against Bitget's own documented
+    response shape: symbol, baseCoin, quoteCoin, symbolStatus (tradable
+    iff symbolStatus == "normal" -- Bitget's own API changelog documents
+    other values, e.g. "restrictedAPI", so this checks for exactly the
+    known-tradable value rather than excluding a fixed "known-bad" list)."""
+    if not isinstance(row, dict):
+        return None
+    symbol, base, quote = row.get("symbol"), row.get("baseCoin"), row.get("quoteCoin")
+    status = row.get("symbolStatus")
+    if not (isinstance(symbol, str) and symbol and isinstance(base, str) and base
+            and isinstance(quote, str) and quote and isinstance(status, str) and status):
+        return None
+    return Instrument(symbol=symbol, base_coin=base, quote_coin=quote, market_type=MarketType.FUTURES,
+                       tradable=(status == "normal"), status=status)

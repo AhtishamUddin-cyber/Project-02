@@ -21,6 +21,7 @@ from .exceptions import (
     DataUnavailableError,
 )
 from .models import (
+    Instrument,
     TickerPrice,
     NormalizationIssue,
     NormalizationResult,
@@ -33,6 +34,7 @@ from .models import (
 )
 from .source import MarketDataSource
 from .bitget import BitgetMarketDataSource
+from .discovery import discover_tradable_instruments
 from .normalizer import normalize_candles, normalize_ticker_price
 from .validator import validate_sequence, check_freshness
 from .quality import (
@@ -56,6 +58,7 @@ __all__ = [
     "DataValidationError",
     "DataUnavailableError",
     # models
+    "Instrument",
     "TickerPrice",
     "NormalizationIssue",
     "NormalizationResult",
@@ -68,6 +71,8 @@ __all__ = [
     # interface + adapter
     "MarketDataSource",
     "BitgetMarketDataSource",
+    # instrument discovery
+    "discover_tradable_instruments",
     # normalization / validation
     "normalize_candles",
     "normalize_ticker_price",

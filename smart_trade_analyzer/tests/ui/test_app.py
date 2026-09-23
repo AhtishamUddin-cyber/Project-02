@@ -68,7 +68,19 @@ def bitget_response_router(candle_closes):
 
 def _fresh_app():
     at = AppTest.from_file(APP_PATH, default_timeout=30)
-    at.run()
+    # Force instrument discovery to fail on this initial render,
+    # deterministically, regardless of whether the machine running this
+    # test can actually reach api.bitget.com -- every test below was
+    # written against the free-text-style single-symbol flow, which is
+    # exactly the "manual entry" fallback UI app.py renders when
+    # discovery fails (see render_analyze_tab). The searchable-selector
+    # SUCCESS path is covered separately and thoroughly in
+    # test_app_scanner.py. Without this, these tests would pass or fail
+    # differently depending on whether the machine running them has
+    # working internet access, which is not a property a test should
+    # depend on.
+    with patch(PATCH_TARGET, side_effect=RuntimeError("instrument discovery intentionally disabled for this test file")):
+        at.run()
     return at
 
 

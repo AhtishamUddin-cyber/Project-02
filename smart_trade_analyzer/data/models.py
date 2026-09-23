@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
-from ..contracts import CandleData, Timeframe, DataQualityState
+from ..contracts import CandleData, MarketType, Timeframe, DataQualityState
 
 
 def utc_now() -> datetime:
@@ -83,6 +83,40 @@ class TickerPrice:
             raise ValueError(f"TickerPrice.price must be positive, got {self.price}")
         if not self.source:
             raise ValueError("TickerPrice.source must be a non-empty string")
+
+
+# ---------------------------------------------------------------------------
+# Instrument -- one row of an adapter's list_instruments(), i.e. one symbol
+# the exchange currently lists for a given market, tradable or not. NOT a
+# Phase 1 frozen contract (this is exchange metadata, not analytical
+# output) -- same status as TickerPrice above. `symbol` is exactly the
+# string this project's `pair` parameter expects everywhere else
+# (scan_symbol, get_candles, get_ticker_price).
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class Instrument:
+    symbol: str            # exchange symbol identifier, e.g. "BTCUSDT"
+    base_coin: str         # e.g. "BTC"
+    quote_coin: str        # e.g. "USDT"
+    market_type: MarketType
+    tradable: bool          # derived from `status` below -- never re-derived elsewhere
+    status: str             # the exchange's own raw status string, kept verbatim
+                             # (Bitget spot: "status" e.g. "online"; Bitget
+                             # futures: "symbolStatus" e.g. "normal") -- for
+                             # transparency/debugging, never re-parsed for
+                             # any decision beyond the `tradable` bool a
+                             # source implementation already derived from it
+
+    def __post_init__(self):
+        if not self.symbol:
+            raise ValueError("Instrument.symbol must be a non-empty string")
+        if not self.base_coin:
+            raise ValueError("Instrument.base_coin must be a non-empty string")
+        if not self.quote_coin:
+            raise ValueError("Instrument.quote_coin must be a non-empty string")
+        if not self.status:
+            raise ValueError("Instrument.status must be a non-empty string")
 
 
 # ---------------------------------------------------------------------------

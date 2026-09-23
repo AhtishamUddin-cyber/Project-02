@@ -31,10 +31,10 @@ No Streamlit import exists anywhere in this module, and none should ever be
 added to it.
 """
 from datetime import datetime
-from typing import Optional, Protocol, runtime_checkable
+from typing import List, Optional, Protocol, runtime_checkable
 
 from ..contracts import Timeframe
-from .models import NormalizationResult, TickerPrice
+from .models import Instrument, NormalizationResult, TickerPrice
 
 
 @runtime_checkable
@@ -88,5 +88,23 @@ class MarketDataSource(Protocol):
         condition (callers typically have a fallback, e.g. the last closed
         candle's close) -- see quality.py for how this is combined into a
         DataQuality/MarketData.
+        """
+        ...
+
+    def list_instruments(self) -> List[Instrument]:
+        """Return every instrument the exchange currently lists for this
+        source's own market (spot or futures), tradable or not -- each
+        one's `Instrument.tradable` flag reflects the exchange's own
+        current status field, never a cached or hardcoded assumption.
+
+        Implementations MUST NOT fabricate an instrument, and MUST NOT
+        silently return an empty list on failure -- raise a
+        DataSourceError subclass instead (same taxonomy as get_candles),
+        so a caller can distinguish "the exchange currently lists zero
+        instruments for this market" (a real, if unlikely, answer) from
+        "the instrument endpoint itself could not be reached or parsed"
+        (a failure). A single malformed row within an otherwise-successful
+        response may be skipped rather than raised, exactly as get_candles
+        treats a single malformed candle row -- see bitget.py.
         """
         ...

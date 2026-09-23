@@ -114,3 +114,45 @@ class OpportunityResult:
                 f"the Quality Gate cannot reach LONG/SHORT without a confirmed, scored "
                 f"setup (see signal_assembly/builder.py), got signal_record=None"
             )
+
+
+@dataclass(frozen=True)
+class ScanFailure:
+    """One symbol that could not be scanned at all -- scan_symbol() (or
+    something it called) raised an unexpected exception for it. This is
+    deliberately NOT turned into a fake WAIT/NO_TRADE OpportunityResult
+    (Section: Scanner Result Rules / Error Handling -- "do not turn the
+    failed symbol into a fake WAIT or NO_TRADE"): a real OpportunityResult
+    always carries a real Decision the Quality Gate actually reached, and
+    for a symbol that crashed mid-scan, no such Decision exists. `error`
+    is a concise, human-readable summary only -- never a raw traceback
+    (matching app.py's own "never leak a traceback to the user" rule);
+    the full exception is available to whoever is running the scan via
+    the same `log` callback BitgetMarketDataSource already uses, if one
+    was supplied to scan_market().
+    """
+    symbol: str
+    pair: str
+    error: str
+
+
+@dataclass(frozen=True)
+class MarketScanResult:
+    """The outcome of one scanner/multi_scan.py::scan_market() call --
+    every symbol that was actually scanned (as a real OpportunityResult,
+    whatever Decision the Quality Gate reached for it) plus every symbol
+    that failed to scan at all (as a ScanFailure, never a fabricated
+    result). `results` is in the SAME order symbols were scanned in --
+    scanner/multi_scan.py's sort_scan_results()/filter_* functions are
+    separate, explicit, presentation-only steps a caller applies to this
+    list; scan_market() itself does not sort or filter anything (Section:
+    Sorting -- "sorting must NOT affect the trading decision", kept true
+    by construction: sorting happens only after every result here is
+    already final).
+    """
+    market_type: MarketType
+    timeframe: Timeframe
+    results: List[OpportunityResult] = field(default_factory=list)
+    failures: List[ScanFailure] = field(default_factory=list)
+    requested_count: int = 0
+    scanned_count: int = 0

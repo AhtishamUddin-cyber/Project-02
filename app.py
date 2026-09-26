@@ -1,6 +1,6 @@
 """Smart Trade Analyzer -- Opportunity UI.
 
-The only Streamlit-importing file in this project. Two tabs:
+The only Streamlit-importing file in this project. Three tabs:
 
   Analyze -- one symbol, picked from a live, searchable Bitget symbol
              list (falls back to manual entry if live discovery fails),
@@ -9,17 +9,24 @@ The only Streamlit-importing file in this project. Two tabs:
              through the SAME scan_symbol() path via scanner.scan_market()
              -- pure orchestration, no independent LONG/SHORT logic of
              its own (see scanner/multi_scan.py's own module docstring).
+  Trade Tracking -- "Track Trade" freezes a finalized OpportunityResult and
+             follows it with actual Bitget ticker prices; history is kept in
+             a local SQLite file, not in session_state. All tracking logic
+             lives in smart_trade_analyzer/tracking (Streamlit-free); this
+             file only renders it. Nothing here places an order.
 
 No mock data, no hardcoded symbol list, no UI-side trading rules anywhere
-in this file. See ui/display_model.py, ui/scanner_display.py, and
-ui/symbol_search.py for the (Streamlit-free, independently unit-tested)
-logic this file only renders.
+in this file. See ui/display_model.py, ui/scanner_display.py,
+ui/symbol_search.py, ui/context.py, and ui/tracking_display.py for the
+(Streamlit-free, independently unit-tested) logic this file only renders,
+and smart_trade_analyzer/tracking/ for all trade-tracking logic proper.
 
 Run with:  streamlit run app.py
 """
 import logging
 import sys
 from pathlib import Path
+from typing import Optional
 
 import streamlit as st
 
@@ -34,7 +41,22 @@ from smart_trade_analyzer.ui import (  # noqa: E402
     OpportunityDisplayModel, build_display_model, build_scan_result_rows, default_symbol_index,
     derive_display_symbol, normalize_pair, search_instruments, validate_pair_input,
 )
-from smart_trade_analyzer.ui.formatting import NOT_AVAILABLE  # noqa: E402
+from smart_trade_analyzer.data.models import utc_now  # noqa: E402
+from smart_trade_analyzer.tracking import (  # noqa: E402
+    DuplicateSignalError, TrackingError, TrackingService, build_default_service, compute_statistics,
+    trackability_problem,
+)
+from smart_trade_analyzer.tracking.definitions import (  # noqa: E402
+    LIMITATIONS, OUTCOME_RULES, STATISTICS_DISCLAIMER, STATUS_DEFINITIONS, STATUS_LABELS,
+)
+from smart_trade_analyzer.ui.context import (  # noqa: E402
+    AnalyzeContext, ScanContext, invalidate_stale_analyze_state, invalidate_stale_scan_state, resolve_max_symbols,
+)
+from smart_trade_analyzer.ui.formatting import NOT_AVAILABLE, format_price, format_timestamp  # noqa: E402
+from smart_trade_analyzer.ui.tracking_display import (  # noqa: E402
+    build_statistics_metrics, build_table_rows, build_trade_detail, describe_price_age, describe_refresh_report,
+    describe_track_error, describe_track_success, short_id, status_label,
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("opportunity_ui")
@@ -175,10 +197,102 @@ def render_technical_metadata(model: OpportunityDisplayModel) -> None:
                 st.write(f"- {reason}")
 
 
-def render_result(model: OpportunityDisplayModel) -> None:
+def _tracking_service() -> TrackingService:
+    """Production wiring: SQLite file + the existing BitgetMarketDataSource.
+    Cheap to build (no I/O until first used), so it is built where needed."""
+    return build_default_service()
+
+
+def _show(level: str, message: str) -> None:
+    {"success": st.success, "info": st.info, "warning": st.warning, "error": st.error}[level](message)
+
+
+def _cached_current_price(key_prefix: str, pair: str):
+    if key_prefix == "analyze":
+        return st.session_state.get("ui_current_price")
+    return (st.session_state.get("scan_price_cache") or {}).get(pair)
+
+
+def _store_current_price(key_prefix: str, pair: str, price) -> None:
+    if key_prefix == "analyze":
+        st.session_state["ui_current_price"] = price
+    else:
+        cache = dict(st.session_state.get("scan_price_cache") or {})
+        cache[pair] = price
+        st.session_state["scan_price_cache"] = cache
+
+
+def render_price_panel(opportunity, key_prefix: str) -> None:
+    """Analysis price (from the result) next to the current Bitget ticker
+    price (fetched through the existing data source). Displays only; the
+    current price never feeds back into any analysis."""
+    market_data = opportunity.market_data
+    analysis_price = market_data.live_price if market_data is not None else None
+    analysis_at = market_data.as_of if market_data is not None else None
+    current = _cached_current_price(key_prefix, opportunity.pair)
+
+    st.markdown("#### Prices")
+    col_analysis, col_current = st.columns(2)
+    col_analysis.metric("Analysis price", format_price(analysis_price) or NOT_AVAILABLE)
+    col_analysis.caption(f"Bitget ticker price captured when this analysis ran ({format_timestamp(analysis_at) or NOT_AVAILABLE}).")
+    col_current.metric("Current price (Bitget)", format_price(current.price) if current is not None else NOT_AVAILABLE)
+    if current is not None:
+        col_current.caption(f"As of {format_timestamp(current.fetched_at)} · {describe_price_age(current.fetched_at, utc_now())}")
+    else:
+        col_current.caption("Not fetched yet — press Refresh price.")
+
+    if st.button("Refresh price", key=f"{key_prefix}_refresh_price"):
+        fresh = _tracking_service().fetch_current_price(opportunity.market_type, opportunity.pair)
+        if fresh is None:
+            st.warning("Could not get a live Bitget price right now."
+                       + (" The last known price above is kept and is aging." if current is not None else ""))
+        else:
+            _store_current_price(key_prefix, opportunity.pair, fresh)
+            st.rerun()
+
+
+def render_track_controls(opportunity, key_prefix: str) -> None:
+    """The Track Trade button. Passes the finalized OpportunityResult
+    straight to the tracking service: nothing is recomputed or modified here.
+    Only results with a complete LONG/SHORT plan get a button."""
+    if trackability_problem(opportunity) is not None:
+        return
+    service = _tracking_service()
+    signal_id = opportunity.signal_record.id
+    existing = service.find_tracked(signal_id)
+    if existing is not None:
+        feedback = (st.session_state.get("track_feedback") or {}).get(signal_id)
+        if feedback:
+            _show(*feedback)
+        st.success(f"✅ Tracked — trade {short_id(existing.trade_id)} · {status_label(existing.status)}. "
+                   f"See the Trade Tracking tab.")
+        return
+
+    st.caption("Track Trade freezes this exact plan and follows it with live Bitget prices. It does not place any order.")
+    if st.button("Track Trade", type="primary", key=f"{key_prefix}_track_button"):
+        try:
+            result = service.track(opportunity)
+        except DuplicateSignalError as exc:
+            st.session_state["track_feedback"] = {signal_id: describe_track_error(exc)}
+            st.rerun()
+        except TrackingError as exc:
+            _show(*describe_track_error(exc))
+        except Exception:
+            logger.exception("Track Trade failed unexpectedly for signal %s", signal_id)
+            st.error("The trade could not be saved. Nothing was tracked.")
+        else:
+            st.session_state["track_feedback"] = {signal_id: describe_track_success(result)}
+            st.rerun()
+
+
+def render_result(model: OpportunityDisplayModel, opportunity=None, key_prefix: str = "analyze") -> None:
     render_decision(model)
     st.divider()
     render_trade_plan(model)
+    if opportunity is not None:
+        st.divider()
+        render_price_panel(opportunity, key_prefix)
+        render_track_controls(opportunity, key_prefix)
     st.divider()
     render_reasons_and_warnings(model)
     st.divider()
@@ -199,6 +313,8 @@ def run_analysis(pair_raw: str, timeframe_value: str, market_type: MarketType) -
     if error:
         st.session_state["ui_error"] = error
         st.session_state["ui_result"] = None
+        st.session_state["ui_opportunity"] = None
+        st.session_state["ui_current_price"] = None
         return
 
     pair = normalize_pair(pair_raw)
@@ -210,6 +326,10 @@ def run_analysis(pair_raw: str, timeframe_value: str, market_type: MarketType) -
             source = BitgetMarketDataSource(market_type=market_type)
             result = scan_symbol(source, symbol=symbol, pair=pair, market_type=market_type, timeframe=timeframe)
             st.session_state["ui_result"] = build_display_model(result)
+            # The raw, finalized result is kept too: Track Trade must freeze its exact
+            # values, and the display model only carries formatted strings.
+            st.session_state["ui_opportunity"] = result
+            st.session_state["ui_current_price"] = _tracking_service().fetch_current_price(market_type, pair)
             st.session_state["ui_error"] = None
         except Exception:
             # Never expose a raw traceback to the user -- but keep the
@@ -223,6 +343,8 @@ def run_analysis(pair_raw: str, timeframe_value: str, market_type: MarketType) -
                 f"Please check the symbol and try again."
             )
             st.session_state["ui_result"] = None
+            st.session_state["ui_opportunity"] = None
+            st.session_state["ui_current_price"] = None
 
 
 def render_analyze_tab() -> None:
@@ -255,10 +377,18 @@ def render_analyze_tab() -> None:
         st.write("")  # vertical alignment spacer
         analyze_clicked = st.button("Analyze", type="primary", use_container_width=True, key="analyze_button")
 
+    # A displayed result is only valid for the exact market/symbol/timeframe that produced
+    # it: discard anything produced under a different selection (audit-fix).
+    current_context = AnalyzeContext(market_type.value, normalize_pair(selected_pair or ""), timeframe_choice)
+    invalidate_stale_analyze_state(st.session_state, current_context)
+
     if analyze_clicked:
+        st.session_state["ui_result_context"] = current_context
         if not selected_pair:
             st.session_state["ui_error"] = "Please choose or enter a symbol."
             st.session_state["ui_result"] = None
+            st.session_state["ui_opportunity"] = None
+            st.session_state["ui_current_price"] = None
         else:
             run_analysis(selected_pair, timeframe_choice, market_type)
 
@@ -267,7 +397,8 @@ def render_analyze_tab() -> None:
     if st.session_state.get("ui_error"):
         st.error(st.session_state["ui_error"])
     elif st.session_state.get("ui_result") is not None:
-        render_result(st.session_state["ui_result"])
+        render_result(st.session_state["ui_result"], opportunity=st.session_state.get("ui_opportunity"),
+                      key_prefix="analyze")
     else:
         st.info("Pick a symbol and timeframe above, then press **Analyze**.")
 
@@ -276,7 +407,7 @@ def render_analyze_tab() -> None:
 # Scanner tab.
 # ---------------------------------------------------------------------------
 
-def run_scan(market_type: MarketType, timeframe_value: str, max_symbols: int) -> None:
+def run_scan(market_type: MarketType, timeframe_value: str, max_symbols: Optional[int]) -> None:
     """The only place scan_market() is called. Discovery happens here
     too (not cached separately from the Analyze tab's copy -- both call
     the same _cached_discover_instruments, so a Spot list fetched from
@@ -288,7 +419,8 @@ def run_scan(market_type: MarketType, timeframe_value: str, max_symbols: int) ->
         st.session_state["scan_result"] = None
         return
 
-    with st.spinner(f"Scanning up to {max_symbols} {market_type.value} symbols ({timeframe.value})… this can take a little while."):
+    scope = f"all {len(instruments)}" if max_symbols is None else f"up to {max_symbols}"
+    with st.spinner(f"Scanning {scope} {market_type.value} symbols ({timeframe.value})… this can take a little while."):
         try:
             source = BitgetMarketDataSource(market_type=market_type)
             result = scan_market(
@@ -314,13 +446,25 @@ def render_scanner_tab() -> None:
         timeframe_choice = st.selectbox("Timeframe", options=_TIMEFRAME_OPTIONS, index=_DEFAULT_TIMEFRAME_INDEX,
                                          key="scan_timeframe")
     with col3:
-        max_symbols = st.number_input("Max symbols", min_value=5, max_value=150, value=30, step=5,
-                                       key="scan_max_symbols",
-                                       help="Caps how many symbols are scanned, to keep scan time and API load reasonable.")
+        max_symbols_cap = st.number_input("Max symbols", min_value=5, max_value=150, value=30, step=5,
+                                           key="scan_max_symbols",
+                                           disabled=bool(st.session_state.get("scan_all_symbols")),
+                                           help="Caps how many symbols are scanned, to keep scan time and API load reasonable.")
+        scan_all = st.checkbox("All symbols (no cap)", key="scan_all_symbols",
+                               help="Scan every tradable symbol Bitget lists for this market instead of a capped number.")
+    max_symbols = resolve_max_symbols(scan_all, int(max_symbols_cap))  # None == "All"
+    if scan_all:
+        st.caption("⚠️ All tradable symbols will be scanned one at a time. Bitget can list hundreds, "
+                   "so a full scan may take many minutes.")
+
+    # A displayed scan is only valid for the market/timeframe/scan size that produced it (audit-fix).
+    current_scan_context = ScanContext(market_type.value, timeframe_choice, max_symbols)
+    invalidate_stale_scan_state(st.session_state, current_scan_context)
 
     scan_clicked = st.button("Scan Market", type="primary", use_container_width=True, key="scan_button")
     if scan_clicked:
-        run_scan(market_type, timeframe_choice, int(max_symbols))
+        st.session_state["scan_result_context"] = current_scan_context
+        run_scan(market_type, timeframe_choice, max_symbols)
 
     st.divider()
 
@@ -377,18 +521,88 @@ def render_scanner_tab() -> None:
     if inspect_pair:
         selected_result = next((r for r in results if r.pair == inspect_pair), None)
         if selected_result is not None:
-            render_result(build_display_model(selected_result))
+            render_result(build_display_model(selected_result), opportunity=selected_result, key_prefix="scan")
+
+
+# ---------------------------------------------------------------------------
+# Trade Tracking tab.
+# ---------------------------------------------------------------------------
+
+def render_tracking_tab() -> None:
+    service = _tracking_service()
+    st.caption("Tracked signals are saved on this machine and followed with actual Bitget ticker prices. "
+               "Nothing here places an order.")
+
+    # Prices refresh only when asked (a button), never implicitly on a page rerun.
+    if st.button("Refresh prices", type="primary", key="tracking_refresh_button"):
+        with st.spinner("Fetching live Bitget prices…"):
+            try:
+                report = service.refresh_active()
+            except Exception:
+                logger.exception("tracking refresh failed")
+                st.error("The refresh failed unexpectedly. No trade was changed.")
+            else:
+                for level, message in describe_refresh_report(report):
+                    _show(level, message)
+
+    trades = service.list_trades()  # read AFTER any refresh so the view reflects it
+    now = utc_now()
+
+    metrics = build_statistics_metrics(compute_statistics(trades))
+    for start in (0, 4):
+        for column, metric in zip(st.columns(4), metrics[start:start + 4]):
+            column.metric(metric.label, metric.value, help=metric.help)
+    st.caption(STATISTICS_DISCLAIMER)
+
+    if not trades:
+        st.info("No tracked trades yet. Analyze or scan a symbol, then press **Track Trade** on an actionable result.")
+    else:
+        active = [t for t in trades if t.is_active]
+        closed = [t for t in trades if not t.is_active]
+        st.markdown("#### Active trades")
+        if active:
+            st.dataframe(build_table_rows(active, now), use_container_width=True, hide_index=True)
+        else:
+            st.caption("None.")
+        st.markdown("#### Closed trades")
+        if closed:
+            st.dataframe(build_table_rows(closed, now), use_container_width=True, hide_index=True)
+        else:
+            st.caption("None.")
+
+        st.markdown("##### Trade details")
+        labels = {t.trade_id: f"{short_id(t.trade_id)} · {t.snapshot.direction.value} {t.snapshot.pair} "
+                              f"{t.snapshot.timeframe.value} · {status_label(t.status)}" for t in trades}
+        chosen = st.selectbox("Choose a trade", options=list(labels), format_func=labels.get,
+                              key="tracking_detail_select")
+        detail = next((t for t in trades if t.trade_id == chosen), None)
+        if detail is not None:
+            for label, value in build_trade_detail(detail, now):
+                st.markdown(f"**{label}:** {value}")
+
+    with st.expander("How outcomes are decided"):
+        st.markdown("**Rules**")
+        for rule in OUTCOME_RULES:
+            st.markdown(f"- {rule}")
+        st.markdown("**Statuses**")
+        for status, definition in STATUS_DEFINITIONS.items():
+            st.markdown(f"- **{STATUS_LABELS[status]}** — {definition}")
+        st.markdown("**Known limitations**")
+        for limitation in LIMITATIONS:
+            st.markdown(f"- {limitation}")
 
 
 def main() -> None:
     st.title("Smart Trade Analyzer")
     st.caption("Every result below comes from the real analytical pipeline; nothing here is simulated.")
 
-    analyze_tab, scanner_tab = st.tabs(["Analyze", "Scanner"])
+    analyze_tab, scanner_tab, tracking_tab = st.tabs(["Analyze", "Scanner", "Trade Tracking"])
     with analyze_tab:
         render_analyze_tab()
     with scanner_tab:
         render_scanner_tab()
+    with tracking_tab:
+        render_tracking_tab()
 
 
 main()

@@ -10,6 +10,10 @@ venv/
 .env
 .streamlit/secrets.toml
 
+# Local trade-tracking database -- machine-specific state, never commit
+*.sqlite3
+*.sqlite3-journal
+
 # OS junk
 .DS_Store
 Thumbs.db

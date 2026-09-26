@@ -1,6 +1,6 @@
 # Smart Trade Analyzer Rewrite — Project Handoff
 
-*Living document, updated at the end of every phase. Reflects the state of the project as of the Live Instrument Discovery + Multi-Coin Scanner phase's completion.*
+*Living document, updated at the end of every phase. Reflects the state of the project as of the Trade Tracking phase's completion.*
 
 ## Status Overview
 
@@ -15,8 +15,9 @@
 | 5 | Entry Engine + Risk Engine + Quality Gate | Implementation + targeted audit-fix complete, awaiting independent sign-off |
 | 6 | Signal Assembly + End-to-End Analytical Pipeline + Scanner Wiring | Implementation complete, awaiting independent audit |
 | UI MVP | Opportunity UI (Streamlit) — `app.py` | Implementation complete, awaiting independent audit |
-| Scanner | Live Instrument Discovery + Searchable Selector + Multi-Coin Scanner | Implementation complete, awaiting independent audit |
-| 7+ | Calibration/shadow-outcome tracking, external HTF/FLOW/SENTIMENT adapters, persistence | **Not started** |
+| Scanner | Live Instrument Discovery + Searchable Selector + Multi-Coin Scanner (incl. audit-fix pass) | Implementation + targeted audit-fix complete, awaiting independent sign-off |
+| Trade Tracking | Track Trade snapshots, live Bitget price panel, SQLite trade history, deterministic outcome engine, statistics | Implementation complete, awaiting independent audit |
+| 7+ | Calibration/shadow-outcome tracking, external HTF/FLOW/SENTIMENT adapters, auto-trading/order execution, news/sentiment | **Not started** |
 
 
 ---
@@ -715,7 +716,97 @@ Covers the task's own 19-item checklist: instrument parsing (spot + futures fiel
 
 ---
 
+## Scanner Audit-Fix Pass
+
+Two outstanding items from the prior Scanner phase audit, fixed ahead of the Trade Tracking batch below:
+
+1. **Explicit "All" symbols option.** The Scanner tab has a new "All symbols (no cap)" checkbox next to "Max symbols". `ui/context.resolve_max_symbols(scan_all, cap)` returns `None` (meaning every discovered instrument, uncapped) when checked, else the numeric cap; `scan_market()` itself already treated `max_symbols=None` as "no cap" (`scanner/multi_scan.py`, unchanged), so this is purely a UI-level wiring fix. The cap number input is disabled while "All" is checked, and a caption warns that a full scan of every tradable symbol can take a while.
+2. **Stale Analyze/Scanner results invalidated on context change.** `ui/context.py` (new, Streamlit-free, unit-tested against a plain-dict stand-in for `session_state`) defines `AnalyzeContext`/`ScanContext` and `invalidate_stale_analyze_state()`/`invalidate_stale_scan_state()`. Both `render_analyze_tab()` and `render_scanner_tab()` now compute the current context (market/pair/timeframe for Analyze; market/timeframe/max_symbols for Scanner) on every rerun and clear the prior result (plus its cached current-price panel state) the moment that context no longer matches what produced it — before any new Analyze/Scan click, not just after. A result is never left on screen under a selection that didn't produce it.
+
+## Trade Tracking
+
+Adds a real trade-tracking system on top of the existing analytical pipeline: freezing an analyzed opportunity into a trade snapshot, following it with actual Bitget ticker prices, persisting the history, and reporting aggregate statistics. **Nothing in this phase alters `scan_symbol()`'s decision logic, and no frozen analytical file was touched** (see Verification performed below).
+
+### Design
+
+- **New `smart_trade_analyzer/tracking/` package** (Streamlit-free, network-free except for reusing the existing `MarketDataSource` ticker; no dependency on `scanner/` beyond reading `OpportunityResult`):
+  - `models.py` — `TradeStatus` (`OPEN`, `TP1_HIT`, `TP2_HIT`, `STOP_LOSS_HIT`, `EXPIRED`, `INVALIDATED`), `TradeOutcome` (`OPEN`, `WIN`, `LOSS`, `EXPIRED`, `INVALIDATED`), the `TradeSnapshot` and `TrackedTrade` frozen dataclasses (full field-level and cross-field invariants enforced in `__post_init__`), `PriceObservation`. `to_contract_status()` maps this package's `STOP_LOSS_HIT` onto the frozen `contracts.signal_record.VALID_STATUSES` spelling (`SL_HIT`) — the two vocabularies differ only in that one name; nothing else in this phase writes to a frozen contract.
+  - `snapshot.py` — `build_trade_snapshot(opportunity)` copies a finalized `OpportunityResult`'s plan values verbatim into a `TradeSnapshot`; never recomputes a level, never mutates the source `OpportunityResult`. `trackability_problem()`/`is_trackable()` refuse anything that isn't a complete, geometrically consistent LONG/SHORT plan, with a stated reason.
+  - `outcome.py` — the pure, deterministic outcome engine (`open_trade`, `apply_observation`, `apply_expiry`, `compute_expires_at`, `baseline_void_reason`). No network, no clock, no I/O; the same trade plus the same observations always produce the same result. Full rules and rationale in the module docstring; summarized in "Outcome rules" below.
+  - `statistics.py` — `compute_statistics()`: total/open/wins/losses/expired/invalidated, win rate and average R over *resolved* trades only (wins + losses), `open_tp1_reached`/`tp1_reached_any` reported separately from wins.
+  - `pricing.py` — `fetch_current_price(source, pair)` wraps `MarketDataSource.get_ticker_price()`; any exception or `None` becomes "unavailable", never a guessed number. `classify_freshness()` is a display-only FRESH/AGING/STALE/UNAVAILABLE label with no effect on any outcome.
+  - `repository.py` — `SqliteTradeRepository`, one `tracked_trades` table (schema below), behind a `TradeRepository` Protocol.
+  - `service.py` — `TrackingService`: `track()` (freeze → duplicate checks → live price fetch → save), `refresh_active()` (batched, rate-limited price refresh), `statistics()`. `build_default_service()` is the production wiring (SQLite file + `BitgetMarketDataSource`, tighter timeout/retry than the analysis default).
+  - `definitions.py` — the exact user-facing rule/status text shown in the UI's "How outcomes are decided" panel; checked by tests against the engine's real behavior so the documentation cannot silently drift from the code.
+  - `constants.py` — every provisional/unvalidated number in one place (`TRADE_TTL_CANDLES = 48`, refresh pacing/failure thresholds, price-freshness display thresholds), each labeled as such.
+- **New `ui/context.py`** (audit-fix helpers, described above) and **`ui/tracking_display.py`** (Streamlit-free formatting: status labels, table rows, trade detail, refresh/track feedback messages) — `app.py` renders what these return; neither computes a level, a status, or an outcome.
+- **`app.py`**: a third tab, "Trade Tracking" (statistics row, active/closed trade tables, a trade-detail picker, a "Refresh prices" button, and the rules/limitations panel); a live-price panel under both Analyze's and the Scanner's result view (Analysis price vs. current Bitget price, with a "Refresh price" button); a "Track Trade" button that appears only when `trackability_problem()` is `None`, freezes the exact displayed `OpportunityResult`, and is replaced by a tracked-status message once a signal is tracked. The raw `OpportunityResult` (not just its formatted display model) is now kept in `session_state["ui_opportunity"]` so Track Trade has the real object to freeze.
+
+### Track Trade flow
+
+1. `build_trade_snapshot()` freezes the displayed, finalized `OpportunityResult` (refuses anything without a complete LONG/SHORT plan, with a stated reason).
+2. Refused as a duplicate if the same `signal_id` is already tracked, or if an identical plan (`TradeSnapshot.plan_fingerprint` — pair/market/timeframe/direction/setup/entry/SL/TP1/TP2) is still *active* (`OPEN`/`TP1_HIT`); a plan identical to an already-*closed* trade can be tracked again.
+3. **Fails closed**: one live Bitget ticker price is fetched through the existing `BitgetMarketDataSource`; if unavailable (network failure or no data), nothing is saved.
+4. That price becomes `tracking_price`/`tracked_at`. If it is already beyond the stop, beyond the plan's `invalidation_price` (checked in that order — real BREAKOUT_RETEST/REVERSAL plans can have invalidation nearer than the stop; confirmed against the actual risk/entry engines, not assumed), or at/through TP1, the trade is saved directly as `INVALIDATED` (it was never live). Otherwise it starts `OPEN`, entry assumed filled at the frozen entry.
+5. The repository's own duplicate checks re-run atomically at insert time (belt-and-suspenders against a race between the service-level check and the write).
+
+### Outcome rules (approved; see also `tracking/definitions.py` and `outcome.py`'s docstring)
+
+- Only actual Bitget ticker prices observed strictly **after** `tracked_at` can change a trade; the analyzer is never re-run and Entry/SL/TP are never recomputed.
+- A level is "touched" inclusively (LONG: stop at/below SL, targets at/above TP1/TP2; SHORT mirrors).
+- **Precedence within one observation: stop beats target.** If a single observation's range could imply both, the conservative reading (a loss) wins — the exact intrabar sequence is undocumented and not pretended to be known.
+- Reaching TP2 also credits TP1 at the same observation if not already reached.
+- **TP1 is a milestone, not a result.** `TP1_HIT` stays monitored. Only `TP2_HIT` is a WIN (R = the plan's own frozen `risk_reward_2`).
+- **The stop is final at any time, including after TP1** — `STOP_LOSS_HIT` is always a LOSS (R = −1). Partial exits and breakeven stops are not modeled in this MVP.
+- `EXPIRED` (unresolved `TRADE_TTL_CANDLES` = 48 candles of the trade's own timeframe after tracking) and `INVALIDATED` (void at tracking) are both terminal, carry no R, and are excluded from win rate/average R.
+- No lookahead: duplicate or out-of-order observations (not strictly after the trade's latest recorded observation) are ignored; an observation past `expires_at` is not evidence — it expires the trade instead.
+- **Documented limitation**: prices are point *samples* taken whenever a refresh runs, not a continuous feed — anything the market did between two samples is invisible (e.g., a stop briefly touched and recovered between refreshes cannot be seen). Each trade records `observation_count` and `max_observation_gap_seconds` so this exposure is visible per trade, shown in the UI's trade detail and limitations panel.
+
+### Live price
+
+Reuses `BitgetMarketDataSource.get_ticker_price()` exactly as it exists (zero changes to `data/bitget.py`); `tracking/pricing.py` and `tracking/service.py` are an additive wrapper, not a second implementation. `build_default_service()` constructs its own `BitgetMarketDataSource` instances with a tighter timeout/retry budget than analysis (`TRACKING_TICKER_TIMEOUT_SECONDS`/`TRACKING_TICKER_MAX_ATTEMPTS` in `constants.py`) so a Track Trade click or a refresh fails fast against an unreachable exchange rather than hanging. `refresh_active()` makes exactly one ticker call per distinct (market, pair) no matter how many tracked trades share it, pausing between distinct instruments, and stops early after `REFRESH_MAX_CONSECUTIVE_FAILURES` consecutive failures rather than hanging on a dead exchange; a failed fetch changes no trade and simply leaves its last known price to age (freshness is a display label, computed at render time, never persisted as a decision). Refresh only ever runs from an explicit button click, never implicitly on a rerun.
+
+### Database schema (SQLite, `trade_history.sqlite3` at the repo root by default; overridable via `SMART_TRADE_ANALYZER_DB`)
+
+One table, `tracked_trades`: `trade_id` (PK), `signal_id` (UNIQUE), the full frozen snapshot (`symbol`, `pair`, `market`, `timeframe`, `direction`, `setup`, `quality_score`, `grade`, `entry`, `entry_zone_low/high`, `confirmation_price`, `invalidation_price`, `stop_loss`, `take_profit_1/2`, `risk_reward_1/2`, `analysis_price`, `analysis_price_source`, `signal_generated_at`, `tracking_price`, `tracked_at`, `expires_at`), and the mutable lifecycle state (`status`, `outcome`, `tp1_hit_at/price`, `tp2_hit_at/price`, `sl_hit_at/price`, `closed_at`, `close_reason`, `realized_r`, `latest_price`, `latest_price_at`, `observation_count`, `max_observation_gap_seconds`). Enforced by the database itself, not just application code: CHECK constraints on every enum, on LONG/SHORT plan geometry, and on status↔outcome consistency; a `BEFORE UPDATE` trigger that aborts any attempt to modify a frozen snapshot column; a second trigger that aborts any update at all once a trade's status is terminal; a partial UNIQUE index preventing two *active* trades from sharing the same plan fingerprint. Writes use `BEGIN IMMEDIATE` (one short-lived connection per operation) so concurrent callers serialize rather than losing an update; schema version is tracked via `PRAGMA user_version` and a mismatched existing file is refused, never silently reused or overwritten.
+
+### Statistics
+
+`Total tracked`, `Open (incl. TP1 reached)` with a separate `open_tp1_reached` count, `Wins (TP2 hit)`, `Losses (stop hit)`, `Expired / invalidated`, `Win rate` and `Total/Average realized R` computed over *resolved* trades only (wins + losses — expired/invalidated trades are excluded, not counted as losses). Every label and the disclaimer shown with them describes tracked historical signals only; none claims accuracy, a probability of winning, an expected future win rate, or a strategy guarantee (tested directly against the shown text).
+
+### Files created
+
+`smart_trade_analyzer/tracking/{__init__,constants,errors,models,snapshot,outcome,statistics,pricing,repository,service,definitions}.py`; `smart_trade_analyzer/ui/{context,tracking_display}.py`; tests: `smart_trade_analyzer/tests/tracking_support.py` (shared fixtures/factories, not a test module itself), `smart_trade_analyzer/tests/unit/test_tracking_{models,snapshot,outcome,repository,service,statistics,definitions}.py`, `smart_trade_analyzer/tests/unit/test_ui_context.py`, `smart_trade_analyzer/tests/ui/test_app_tracking.py`.
+
+### Files modified
+
+`app.py` (third tab, price panel, Track Trade button, the two audit-fixes — zero changes to any call into `scanner`/`pipeline`/`data` beyond the additive `fetch_current_price`/tracking calls); `smart_trade_analyzer/tests/ui/conftest.py` (added a second autouse fixture isolating each UI test's tracking database to its own `tmp_path`, alongside the existing cache-clearing one); `.gitignore` (`*.sqlite3`).
+
+### Frozen files confirmed untouched
+
+Diffed directly against this session's own pristine extraction of the delivered ZIP (SHA-256, not just `diff`): `contracts/`, `features/`, `regime/`, `setup/`, `confluence/`, `entry/`, `risk/`, `quality_gate/`, `pipeline/`, `signal_assembly/`, and `scanner/engine.py` (`scan_symbol()`/`analyze_market()` themselves) — all 44 frozen files byte-identical. `scanner/multi_scan.py`, `scanner/models.py`, and `data/` were not modified either (only `app.py`, one test conftest, and `.gitignore` were touched among existing files; everything else new is additive).
+
+### Testing
+
+This phase adds 243 new tests (1078 total: 835 prior baseline + 243 new — 221 unit + 22 UI). All 1078 pass under both plain `pytest` and `-W error`; the only warning under `-W error` is the same already-documented, benign Streamlit interpreter-shutdown `ResourceWarning` on record since the Opportunity UI MVP phase. Covers every item on the task's own list: snapshot creation and immutability (against *real* pipeline-produced `OpportunityResult`s, not hand-built stand-ins), LONG/SHORT TP and SL detection (parametrized cases plus a LONG/SHORT-parametrized independent price-grid oracle sweeping 401 price points each), deterministic precedence (stop-beats-target, TP2-credits-TP1, verified both directly and as a documented-vs-actual consistency check), missing/stale price handling, duplicate Track Trade protection (service-level and DB-level, including a genuine two-thread race against the SQLite lock), persistence save/load round-tripping every field, status transitions and their invariants, statistics, the live price source (direct + through the real running app), scanner integration, no mutation of `OpportunityResult`, no fabricated outcomes (a random-price sweep that never produces a result, plus a dedicated no-lookahead suite), and context changes never mutating an already-tracked trade (the tracking DB is untouched by the audit-fix invalidation, which only clears *display* state). UI tests run the real `app.py` end-to-end via `streamlit.testing.v1.AppTest`, patching only `requests.get` — the real `scan_symbol()`, `scan_market()`, and `TrackingService` all execute unmocked, against a real per-test SQLite file.
+
+### Environment limitations
+
+This sandbox cannot reach `api.bitget.com` (confirmed, egress-blocked) — every Bitget-dependent test, including the new ones, patches `requests.get` (same convention as `test_bitget_adapter.py`). A live run against the real Bitget ticker endpoint, on a machine with normal internet access, is still needed and has not been done in this phase either.
+
+### Known limitations (beyond the sampled-ticker limitation already covered above)
+
+- `TRADE_TTL_CANDLES = 48` is a provisional, unvalidated constant, not calibrated against real trade durations.
+- No fee, slippage, or partial-fill modeling; entry is always assumed filled exactly at the frozen entry price.
+- No partial-position/breakeven-stop accounting — a stop after TP1 is a full −1R loss, by design for this MVP (see Outcome rules).
+- A tracked price's timestamp is when this application received it, not the exchange's own trade time.
+- Out of scope for this phase, per the approved boundary: auto-trading, exchange order execution, real-money trading, leverage automation, portfolio management, advanced backtesting, ML, news/social sentiment, predictive win probability, automated position management.
+
+**Trade Tracking implementation complete — awaiting independent audit. Not self-approved.**
+
+---
+
 ## Next Task
 
-**Not yet scoped or approved.** Recommended immediate next action: an independent audit of this phase (instrument discovery, the searchable selector, and the multi-coin scanner), alongside the still-outstanding audits noted earlier in this document (the Opportunity UI MVP, Phase 6, and the Phase 5 audit-fix sign-off). A first live run against the real Bitget API, on a machine with normal internet access, remains worth doing before further iteration — for both the single-symbol flow and, newly, the live instrument discovery and multi-symbol scan added here. Beyond that, the remaining unscoped candidates are unchanged: `calibration/`/shadow-outcome tracking, the external HTF/FLOW/SENTIMENT adapters, and persistence. Waiting for an explicit next-phase prompt and approval before any further work begins.
+**Not yet scoped or approved.** Recommended immediate next action: an independent audit of this phase (Track Trade, the live price panel, persistence, the outcome engine, and statistics) and of the Scanner audit-fix pass above, alongside the still-outstanding audits noted earlier in this document (the Opportunity UI MVP, Phase 6, the Phase 5 audit-fix sign-off, and the Scanner phase itself). A first live run against the real Bitget API, on a machine with normal internet access, remains worth doing before further iteration — now covering the ticker endpoint specifically, in addition to candles and instrument discovery. Beyond that, the remaining unscoped candidates are unchanged: `calibration/`/shadow-outcome tracking, the external HTF/FLOW/SENTIMENT adapters, auto-trading/order execution, and news/social sentiment (explicitly deferred, not faked). Waiting for an explicit next-phase prompt and approval before any further work begins.
 
